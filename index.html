@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Genealogia Exploratória</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden;background:#111;font-family:'Courier New',monospace}
+#root{width:100%;height:100%;position:relative;overflow:hidden;display:flex}
+#canvasWrap{flex:1;position:relative;min-width:0}
+canvas{display:block;width:100%;height:100%}
+/* ── Loading screen ── */
+#loading{
+  position:absolute;inset:0;z-index:50;
+  background:#111;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;
+  transition:opacity .7s ease;
+}
+#loading.hidden{opacity:0;pointer-events:none;}
+#loading-spinner{
+  width:38px;height:38px;
+  border:3px solid #1e1e2e;
+  border-top-color:#4f8cff;
+  border-radius:50%;
+  animation:spin .85s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loading-label{color:#444;font-size:12px;letter-spacing:.08em;}
+#loading-error{
+  color:#c0392b;font-size:12px;display:none;
+  max-width:300px;text-align:center;line-height:1.7;
+  background:#1a0000;border:1px solid #4a0000;
+  border-radius:6px;padding:12px 16px;
+}
+
+/* ── Painel lateral ── */
+#panel{
+  width:0;overflow:hidden;
+  background:#13131f;
+  border-left:1px solid #2a2a3a;
+  transition:width .5s cubic-bezier(0.4,0,0.2,1), opacity .45s ease;
+  display:flex;flex-direction:column;
+  position:relative;
+  flex-shrink:0;
+}
+#panel.open{ width:320px; }
+#panelClose{
+  position:absolute;top:10px;right:12px;
+  background:none;border:none;color:#666;font-size:18px;cursor:pointer;
+  line-height:1;
+}
+#panelClose:hover{color:#fff}
+#panelContent{
+  padding:20px 18px 20px 18px;
+  overflow-y:auto;flex:1;
+  display:flex;flex-direction:column;gap:14px;
+}
+.p-name{
+  font-size:15px;font-weight:bold;color:#fff;
+  border-bottom:2px solid #2a2a4a;padding-bottom:10px;
+  padding-right:28px;line-height:1.3;
+}
+.p-name.male  { border-color:#4f8cff; }
+.p-name.female{ border-color:#ff6fb3; }
+.p-badge{
+  display:inline-block;font-size:10px;padding:2px 7px;border-radius:10px;
+  margin-top:4px;vertical-align:middle;
+}
+.male-badge  { background:#1a2a4a;color:#4f8cff; }
+.female-badge{ background:#2a1a2a;color:#ff6fb3; }
+
+.p-section{ display:flex;flex-direction:column;gap:6px; }
+.p-section-title{
+  font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+  color:#555;font-weight:bold;
+}
+.p-row{ display:flex;gap:8px;align-items:flex-start; }
+.p-icon{ font-size:14px;width:18px;flex-shrink:0;margin-top:1px; }
+.p-label{ font-size:11px;color:#888;min-width:52px;flex-shrink:0; }
+.p-val  { font-size:12px;color:#ccc;line-height:1.4; }
+.p-val.empty{ color:#444;font-style:italic; }
+
+.p-sumario{
+  background:#1a1a2e;border-radius:8px;padding:12px;
+  font-size:12px;color:#aaa;line-height:1.6;
+  border-left:3px solid #2a2a5a;
+}
+.p-sumario.empty{ color:#444;font-style:italic; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="canvasWrap">
+    <div id="loading">
+      <div id="loading-spinner"></div>
+      <div id="loading-label">Carregando árvore genealógica…</div>
+      <div id="loading-error"></div>
+    </div>
+    <canvas id="cvs"></canvas>
+  </div>
+
+  <div id="panel">
+    <button id="panelClose">×</button>
+    <div id="panelContent"></div>
+  </div>
+</div>
+
+<script>
+const canvas  = document.getElementById('cvs');
+const ctx     = canvas.getContext('2d');
+const wrap    = document.getElementById('canvasWrap');
+const panel   = document.getElementById('panel');
+const panelContent = document.getElementById('panelContent');
+document.getElementById('panelClose').onclick = closePanel;
+
+const CARD_W = 170, CARD_H = 54, BTN_R = 14;
+const H_GAP  = 240,  V_GAP  = 150, PAD = 30;
+
+const people  = new Map();
+const visible = new Map();
+let scale = 1, panX = 0, panY = 0;
+let isPanning = false, lastMX = 0, lastMY = 0;
+let dirty = false;
+let selectedId = null;
+
+// ── resize ────────────────────────────────────────────────
+// Debounced + só executa se as dimensões realmente mudaram.
+// Usa setTransform em vez de scale para evitar acumulação.
+let resizeTimer=null;
+let lastW=0, lastH=0;
+function resize(){
+  clearTimeout(resizeTimer);
+  resizeTimer=setTimeout(()=>{
+    const r=wrap.getBoundingClientRect();
+    const w=Math.round(r.width), h=Math.round(r.height);
+    if(w===lastW && h===lastH){ render(); return; } // só redraw, sem resetar canvas
+    lastW=w; lastH=h;
+    canvas.width=w*devicePixelRatio;
+    canvas.height=h*devicePixelRatio;
+    canvas.style.width=w+'px';
+    canvas.style.height=h+'px';
+    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); // substitui, não acumula
+    render();
+  },150);
+}
+new ResizeObserver(resize).observe(wrap);
+
+// ── carrega planilha automaticamente via fetch ───────────
+// O arquivo fica em data/pessoas.xlsx no mesmo repositório.
+// Só o dono do repositório pode alterá-lo via git push.
+const DATA_URL = 'data/pessoas.xlsx';
+
+async function fetchData(){
+  try {
+    const res = await fetch(DATA_URL);
+    if(!res.ok) throw new Error(`HTTP ${res.status} — arquivo não encontrado em "${DATA_URL}"`);
+    const buf = await res.arrayBuffer();
+    const wb  = XLSX.read(buf);
+    const json= XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {defval:''});
+    loadData(json);
+    // esconde loading com fade
+    const el=document.getElementById('loading');
+    el.classList.add('hidden');
+    setTimeout(()=>el.style.display='none', 750);
+  } catch(err){
+    const errEl=document.getElementById('loading-error');
+    document.getElementById('loading-spinner').style.display='none';
+    document.getElementById('loading-label').style.display='none';
+    errEl.style.display='block';
+    errEl.textContent='Erro ao carregar dados: '+err.message;
+    console.error(err);
+  }
+}
+
+function nk(k){
+  return String(k).normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase().replace(/\s+/g,'').replace(/[^a-z0-9]/g,'');
+}
+function clean(v){ if(!v) return null; const s=String(v).trim(); return s||null; }
+function pl(v){ if(!v)return[]; return String(v).split(',').map(s=>s.trim()).filter(Boolean); }
+
+function loadData(json){
+  people.clear();
+  json.forEach((row,i)=>{
+    const n={}; Object.keys(row).forEach(k=>{n[nk(k)]=row[k];});
+    const id=String(n.id||n.codigo||n.pessoaid||`AUTO_${i}`).trim();
+    people.set(id,{
+      id,
+      nome:    n.nome||n.nomecompleto||n.pessoa||n.name||id,
+      sexo:    String(n.sexo||n.gender||'M').toUpperCase(),
+      pai:     clean(n.idpai||n.iddopai||n.iddopairefcola||n.pai||n.father||n.paiid),
+      mae:     clean(n.idmae||n.iddamae||n.iddamaerefcola||n.mae||n.mother||n.maeid),
+      conjuges:pl(n.idconjuge||n.iddoconjuge||n.iddoconjugerefcola||n.conjuge||n.conjuges||n.spouse),
+      filhos:  [],
+      expanded:{up:false,down:false,left:false,right:false},
+      // novos campos
+      dataNasc:  clean(n.datanascimento||n.dtnascimento||n.nascimento),
+      localNasc: clean(n.localnascimento||n.locdenascimento),
+      dataObit:  clean(n.dataobito||n.dtobito||n.obito||n.falecimento),
+      localObit: clean(n.localobito||n.locdeobito),
+      dataCas:   clean(n.datacasamento||n.dtcasamento||n.casamento),
+      localCas:  clean(n.localcasamento||n.locdecasamento),
+      sumario:   clean(n.sumario||n.resumo||n.bio||n.descricao),
+    });
+  });
+  people.forEach(p=>{
+    if(p.pai&&people.has(p.pai)) people.get(p.pai).filhos.push(p.id);
+    if(p.mae&&people.has(p.mae)) people.get(p.mae).filhos.push(p.id);
+  });
+  people.forEach(p=>{ p.filhos=[...new Set(p.filhos)]; });
+
+  visible.clear();
+  const root=Array.from(people.values()).find(p=>p.nome.toLowerCase().includes('oscar'))
+            ||people.values().next().value;
+  if(!root) return;
+  const r=wrap.getBoundingClientRect();
+  visible.set(root.id,{...root,x:r.width/2,y:r.height/2});
+  panX=0;panY=0;scale=1;
+  closePanel();
+  render();
+}
+
+// ── painel lateral ────────────────────────────────────────
+function openPanel(id){
+  const p=visible.get(id)||people.get(id);
+  if(!p) return;
+  selectedId=id;
+
+  const isFemale=p.sexo==='F';
+  const badge=isFemale
+    ?'<span class="p-badge female-badge">♀ Feminino</span>'
+    :'<span class="p-badge male-badge">♂ Masculino</span>';
+
+  function row(icon,label,val){
+    const empty=!val;
+    const display=val||'Não informado';
+    return `<div class="p-row">
+      <span class="p-icon">${icon}</span>
+      <span class="p-label">${label}</span>
+      <span class="p-val${empty?' empty':''}">${display}</span>
+    </div>`;
+  }
+
+  // resolve nome do pai e da mãe a partir do people Map
+  const paiNome = p.pai && people.has(p.pai) ? people.get(p.pai).nome : null;
+  const maeNome = p.mae && people.has(p.mae) ? people.get(p.mae).nome : null;
+
+  panelContent.innerHTML=`
+    <div class="p-name ${isFemale?'female':'male'}">
+      ${p.nome}<br>${badge}
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">👨‍👩‍👦 Filiação</div>
+      ${row('👨','Pai', paiNome)}
+      ${row('👩','Mãe', maeNome)}
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">📅 Nascimento</div>
+      ${row('🗓️','Data',p.dataNasc)}
+      ${row('📍','Local',p.localNasc)}
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">✝️ Óbito</div>
+      ${row('🗓️','Data',p.dataObit)}
+      ${row('📍','Local',p.localObit)}
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">💍 Casamento</div>
+      ${row('🗓️','Data',p.dataCas)}
+      ${row('📍','Local',p.localCas)}
+    </div>
+
+    <div class="p-section">
+      <div class="p-section-title">📝 Sumário</div>
+      <div class="p-sumario${!p.sumario?' empty':''}">${p.sumario||'Sem descrição.'}</div>
+    </div>
+  `;
+
+  // fade-in suave do conteúdo
+  panelContent.style.opacity='0';
+  panel.classList.add('open');
+  setTimeout(()=>{ panelContent.style.transition='opacity .35s ease'; panelContent.style.opacity='1'; }, 80);
+}
+
+function closePanel(){
+  panelContent.style.transition='opacity .2s ease';
+  panelContent.style.opacity='0';
+  setTimeout(()=>{ panel.classList.remove('open'); }, 150);
+  selectedId=null;
+  render();
+}
+
+// ── helpers ───────────────────────────────────────────────
+function getSiblings(p){
+  return Array.from(people.values()).filter(q=>
+    q.id!==p.id&&((p.pai&&q.pai===p.pai)||(p.mae&&q.mae===p.mae))
+  );
+}
+
+function shiftSet(ids,dx){
+  ids.forEach(id=>{ const n=visible.get(id); if(n) n.x+=dx; });
+}
+
+// ── makeRoom ──────────────────────────────────────────────
+function makeRoom(newCards){
+  if(!newCards.length) return;
+  let zL=Infinity,zR=-Infinity,zYlo=Infinity,zYhi=-Infinity;
+  newCards.forEach(c=>{
+    zL=Math.min(zL,c.x-CARD_W/2); zR=Math.max(zR,c.x+CARD_W/2);
+    zYlo=Math.min(zYlo,c.y-CARD_H/2-10); zYhi=Math.max(zYhi,c.y+CARD_H/2+10);
+  });
+  const zCX=(zL+zR)/2;
+
+  function buildFamilies(){
+    const inY=[];
+    visible.forEach((c,id)=>{
+      if(c.y-CARD_H/2>zYhi||c.y+CARD_H/2<zYlo) return;
+      inY.push(id);
+    });
+    const assigned=new Set(), families=[];
+    inY.forEach(id=>{
+      if(assigned.has(id)) return;
+      const fam=new Set([id]); assigned.add(id);
+      const c=visible.get(id);
+      inY.forEach(oid=>{
+        if(assigned.has(oid)) return;
+        const o=visible.get(oid);
+        if(c.filhos.some(fid=>o.filhos&&o.filhos.includes(fid))){
+          fam.add(oid); assigned.add(oid);
+        }
+      });
+      families.push(fam);
+    });
+    return families;
+  }
+
+  for(let pass=0;pass<20;pass++){
+    let moved=false;
+    buildFamilies().forEach(fam=>{
+      let sumX=0,cnt=0,fL=Infinity,fR=-Infinity;
+      fam.forEach(id=>{ const n=visible.get(id); if(!n)return; sumX+=n.x;cnt++;
+        fL=Math.min(fL,n.x-CARD_W/2); fR=Math.max(fR,n.x+CARD_W/2); });
+      const famCX=sumX/cnt;
+      const ovlp=Math.min(fR+PAD,zR+PAD)-Math.max(fL-PAD,zL-PAD);
+      if(ovlp<=0) return;
+      shiftSet(fam, famCX<zCX?-ovlp:+ovlp);
+      moved=true;
+    });
+    if(!moved) break;
+  }
+}
+
+// ── toggle ────────────────────────────────────────────────
+function toggleDir(personId,dir){
+  const person=visible.get(personId); if(!person) return;
+  person.expanded[dir]=!person.expanded[dir];
+  if(!person.expanded[dir]){ removeDir(person,dir); render(); return; }
+
+  if(dir==='up'){
+    const pids=[person.pai,person.mae].filter(Boolean);
+    if(!pids.length){ render(); return; }
+    const total=(pids.length-1)*H_GAP;
+    const newCards=pids.map((id,i)=>({id,x:person.x-total/2+i*H_GAP,y:person.y-V_GAP}));
+    makeRoom(newCards);
+    const cx=person.x;
+    pids.forEach((pid,i)=>{
+      const p=people.get(pid); if(!p) return;
+      visible.set(pid,{...p,x:cx-total/2+i*H_GAP,y:person.y-V_GAP});
+    });
+  }
+  if(dir==='down'){
+    const n=person.filhos.length;
+    const newCards=person.filhos.map((cid,i)=>({id:cid,x:person.x+(i-(n-1)/2)*H_GAP,y:person.y+V_GAP}));
+    makeRoom(newCards);
+    const cx=person.x;
+    person.filhos.forEach((cid,i)=>{
+      const c=people.get(cid); if(!c) return;
+      visible.set(cid,{...c,x:cx+(i-(n-1)/2)*H_GAP,y:person.y+V_GAP});
+    });
+  }
+  if(dir==='right'){
+    const newCards=person.conjuges.map((sid,i)=>({id:sid,x:person.x+H_GAP*(i+1),y:person.y}));
+    makeRoom(newCards);
+    person.conjuges.forEach((sid,i)=>{
+      const s=people.get(sid); if(!s) return;
+      visible.set(sid,{...s,x:person.x+H_GAP*(i+1),y:person.y});
+    });
+  }
+  if(dir==='left'){
+    const sibs=getSiblings(person);
+    const total=(sibs.length-1)*H_GAP;
+    const newCards=sibs.map((sib,i)=>({id:sib.id,x:person.x-H_GAP-total+i*H_GAP,y:person.y}));
+    makeRoom(newCards);
+    sibs.forEach((sib,i)=>{
+      visible.set(sib.id,{...sib,x:person.x-H_GAP-total+i*H_GAP,y:person.y});
+    });
+  }
+  render();
+}
+
+function removeDir(person,dir){
+  const del=ids=>ids.forEach(id=>{
+    const c=visible.get(id);
+    if(c){['up','down','left','right'].forEach(d=>{if(c.expanded[d])removeDir(c,d);});}
+    visible.delete(id);
+  });
+  if(dir==='up')    del([person.pai,person.mae].filter(Boolean));
+  if(dir==='down')  del([...person.filhos]);
+  if(dir==='right') del([...person.conjuges]);
+  if(dir==='left')  del(getSiblings(person).map(s=>s.id));
+}
+
+// ── links ─────────────────────────────────────────────────
+function buildLinks(){
+  const seen=new Set(),res=[];
+  visible.forEach(p=>{
+    const add=(a,b)=>{ const k=[a,b].sort().join('|'); if(!seen.has(k)){seen.add(k);res.push({s:a,t:b});} };
+    [p.pai,p.mae].filter(Boolean).forEach(pid=>{if(visible.has(pid))add(pid,p.id);});
+    p.filhos.forEach(cid=>{if(visible.has(cid))add(p.id,cid);});
+    p.conjuges.forEach(sid=>{if(visible.has(sid))add(p.id,sid);});
+  });
+  return res;
+}
+
+// ── world → screen ────────────────────────────────────────
+function w2s(x,y){
+  const r=wrap.getBoundingClientRect();
+  return[x*scale+panX+r.width/2*(1-scale), y*scale+panY+r.height/2*(1-scale)];
+}
+function btnPos(card,dir){
+  const[cx,cy]=w2s(card.x,card.y);
+  if(dir==='up')    return[cx,cy-CARD_H/2*scale-BTN_R*scale-4];
+  if(dir==='down')  return[cx,cy+CARD_H/2*scale+BTN_R*scale+4];
+  if(dir==='left')  return[cx-CARD_W/2*scale-BTN_R*scale-4,cy];
+  if(dir==='right') return[cx+CARD_W/2*scale+BTN_R*scale+4,cy];
+}
+
+// ── render ────────────────────────────────────────────────
+function render(){
+  if(dirty)return; dirty=true;
+  requestAnimationFrame(()=>{
+    dirty=false;
+    const r=wrap.getBoundingClientRect();
+    // garante transform correto independente do histórico do contexto
+    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+    ctx.clearRect(0,0,r.width,r.height);
+    ctx.fillStyle='#111'; ctx.fillRect(0,0,r.width,r.height);
+
+    // links
+    ctx.strokeStyle='#444'; ctx.lineWidth=1.5;
+    buildLinks().forEach(({s,t})=>{
+      const src=visible.get(s),tgt=visible.get(t); if(!src||!tgt)return;
+      const[x1,y1]=w2s(src.x,src.y),[x2,y2]=w2s(tgt.x,tgt.y);
+      const midY=(y1+y2)/2;
+      ctx.beginPath(); ctx.moveTo(x1,y1);
+      ctx.bezierCurveTo(x1,midY,x2,midY,x2,y2);
+      ctx.stroke();
+    });
+
+    // cards
+    visible.forEach(card=>{
+      const[cx,cy]=w2s(card.x,card.y);
+      const cw=CARD_W*scale,ch=CARD_H*scale,x=cx-cw/2,y=cy-ch/2,rr=10*scale;
+      const isSelected=card.id===selectedId;
+
+      ctx.beginPath(); ctx.roundRect(x,y,cw,ch,rr);
+      ctx.fillStyle=isSelected?'#1e2a4a':'#1a1a2e'; ctx.fill();
+
+      // brilho de seleção
+      if(isSelected){
+        ctx.shadowColor=card.sexo==='F'?'#ff6fb3':'#4f8cff';
+        ctx.shadowBlur=14*scale;
+      }
+      ctx.strokeStyle=card.sexo==='F'?'#ff6fb3':'#4f8cff';
+      ctx.lineWidth=isSelected?3:2; ctx.stroke();
+      ctx.shadowBlur=0;
+
+      // nome
+      ctx.fillStyle='#fff';
+      ctx.font=`${Math.max(11,13*scale)}px 'Courier New',monospace`;
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      const maxW=cw-16*scale; let nome=card.nome;
+      if(ctx.measureText(nome).width>maxW){
+        while(ctx.measureText(nome+'…').width>maxW&&nome.length>0) nome=nome.slice(0,-1);
+        nome+='…';
+      }
+      ctx.fillText(nome,cx,cy);
+
+      // data de nascimento abaixo do nome (se existir e couber)
+      if(card.dataNasc && scale>0.6){
+        ctx.fillStyle='#666';
+        ctx.font=`${Math.max(9,10*scale)}px 'Courier New',monospace`;
+        ctx.fillText(card.dataNasc, cx, cy+ch/2-8*scale);
+      }
+
+      // botões direcionais
+      const defs={
+        up:   [c=>c.pai||c.mae,            '↑','#4f8cff'],
+        down: [c=>c.filhos.length>0,        '↓','#4f8cff'],
+        left: [c=>getSiblings(c).length>0,  '←','#888888'],
+        right:[c=>c.conjuges.length>0,      '→','#ff9f43'],
+      };
+      Object.entries(defs).forEach(([dir,[chk,sym,col]])=>{
+        const has=chk(card);
+        const[bx,by]=btnPos(card,dir),br=BTN_R*scale;
+        ctx.beginPath(); ctx.arc(bx,by,br,0,Math.PI*2);
+        ctx.fillStyle=card.expanded[dir]?'#333':'#1d1d1d'; ctx.fill();
+        ctx.strokeStyle=has?col:'#333'; ctx.lineWidth=1.5; ctx.stroke();
+        ctx.fillStyle=has?(card.expanded[dir]?'#ff6b6b':col):'#444';
+        ctx.font=`${Math.max(10,12*scale)}px 'Courier New',monospace`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(card.expanded[dir]?'×':sym,bx,by+1);
+      });
+    });
+  });
+}
+
+// ── hit test: clique no corpo do card ────────────────────
+function hitCard(mx,my){
+  let hit=null;
+  visible.forEach(card=>{
+    const[cx,cy]=w2s(card.x,card.y);
+    const hw=CARD_W*scale/2, hh=CARD_H*scale/2;
+    if(mx>=cx-hw&&mx<=cx+hw&&my>=cy-hh&&my<=cy+hh) hit=card.id;
+  });
+  return hit;
+}
+
+// ── hit test: clique num botão ────────────────────────────
+function hitButton(mx,my){
+  let result=null;
+  visible.forEach(card=>{
+    ['up','down','left','right'].forEach(dir=>{
+      const[bx,by]=btnPos(card,dir);
+      if(Math.hypot(mx-bx,my-by)<BTN_R*scale+6) result={id:card.id,dir};
+    });
+  });
+  return result;
+}
+
+// ── eventos ───────────────────────────────────────────────
+canvas.addEventListener('wheel',e=>{
+  e.preventDefault();
+  scale=Math.min(3,Math.max(0.15,scale*(e.deltaY<0?1.1:0.9))); render();
+},{passive:false});
+
+canvas.addEventListener('mousedown',e=>{
+  if(e.button!==0)return;
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+
+  const btn=hitButton(mx,my);
+  if(btn){ toggleDir(btn.id,btn.dir); return; }
+
+  const cardId=hitCard(mx,my);
+  if(cardId){
+    if(selectedId===cardId){ closePanel(); }
+    else { openPanel(cardId); render(); }
+    return;
+  }
+
+  isPanning=true; lastMX=mx; lastMY=my;
+});
+
+canvas.addEventListener('mousemove',e=>{
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+  if(isPanning){
+    panX+=mx-lastMX; panY+=my-lastMY;
+    lastMX=mx; lastMY=my; render(); return;
+  }
+  const onBtn=!!hitButton(mx,my);
+  const onCard=!!hitCard(mx,my);
+  canvas.style.cursor=onBtn?'pointer':onCard?'pointer':'grab';
+});
+
+canvas.addEventListener('mouseup',()=>{ isPanning=false; });
+canvas.addEventListener('mouseleave',()=>{ isPanning=false; });
+
+canvas.addEventListener('touchstart',e=>{
+  if(e.touches.length===1){ isPanning=true; lastMX=e.touches[0].clientX; lastMY=e.touches[0].clientY; }
+},{passive:true});
+canvas.addEventListener('touchmove',e=>{
+  if(!isPanning||e.touches.length!==1)return;
+  panX+=e.touches[0].clientX-lastMX; panY+=e.touches[0].clientY-lastMY;
+  lastMX=e.touches[0].clientX; lastMY=e.touches[0].clientY; render();
+},{passive:true});
+canvas.addEventListener('touchend',()=>{ isPanning=false; });
+
+fetchData();
+</script>
+</body>
+</html>
